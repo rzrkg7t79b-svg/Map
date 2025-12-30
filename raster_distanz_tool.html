@@ -1,0 +1,448 @@
+<!doctype html>
+
+<html lang="de">
+
+<head>
+
+  <meta charset="utf-8"/>
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+
+  <title>München Raster (100m) Distanz zu Florist/Garden Centre</title>
+
+  <style>
+
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:16px;line-
+
+height:1.35}
+
+    .box{max-width:920px}
+
+    button{padding:10px 12px;border-radius:10px;border:1px solid #ddd;background:#fff}
+
+    input{padding:8px;border-radius:10px;border:1px solid #ddd}
+
+    small{color:#444}
+
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:10px 0}
+
+    .log{white-space:pre-wrap;background:#f7f7f7;border:1px solid #eee;padding:10px;border-
+
+radius:10px;min-height:90px}
+
+  </style>
+
+</head>
+
+<body>
+
+<div class="box">
+
+  <h2>München: 100×100m Raster + Distanzspalte (Browser/iPad)</h2>
+
+  <p><small>
+
+    Lädt ein GeoJSON (München-Grenze + Shops), erzeugt Rasterpunkte innerhalb der Grenze,
+
+    berechnet Distanz zum nächsten shop=florist oder shop=garden_centre.
+
+  </small></p>
+
+  <div class="row">
+
+    <label><b>GeoJSON laden:</b>
+
+      <input id="file" type="file" accept=".geojson,application/geo+json,application/json">
+
+    </label>
+
+  </div>
+
+  <div class="row">
+
+    <label>Raster (Meter):
+
+      <input id="grid" type="number" min="50" step="50" value="100" style="width:110px">
+
+    </label>
+
+    <button id="run" disabled>Raster berechnen</button>
+
+    <button id="dl" disabled>GeoJSON herunterladen</button>
+
+  </div>
+
+  <div class="row">
+
+
+    <small><b>Output-Felder:</b> distance_m (Meter), inv_intensity (1/(distance+1)), nearest
+
+(florist/garden_centre)</small>
+
+  </div>
+
+  <div class="log" id="log">Bitte GeoJSON laden…</div>
+
+</div>
+
+<script>
+
+  const fileEl = document.getElementById('file');
+
+  const gridEl = document.getElementById('grid');
+
+  const runBtn = document.getElementById('run');
+
+  const dlBtn  = document.getElementById('dl');
+
+  const logEl  = document.getElementById('log');
+
+  let boundaryPolys = []; // array of polygons: each polygon = [ [lon,lat], [lon,lat], ... ] (outer ring
+
+only)
+
+  let shops = [];         // {lat, lon, shop}
+
+  let outGeo = null;
+
+  function log(msg){ logEl.textContent = msg; }
+
+  // Haversine distance in meters
+
+  function toRad(x){ return x*Math.PI/180; }
+
+  function haversine(lat1, lon1, lat2, lon2){
+
+    const R=6371000;
+
+    const dLat=toRad(lat2-lat1), dLon=toRad(lon2-lon1);
+
+    const a=Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/
+
+2)**2;
+
+    return 2*R*Math.asin(Math.sqrt(a));
+
+  }
+
+  // Point-in-polygon (ray casting) for one ring (lon/lat)
+
+  function inRing(ptLon, ptLat, ring){
+
+    let inside = false;
+
+    for (let i=0, j=ring.length-1; i<ring.length; j=i++){
+
+      const xi=ring[i][0], yi=ring[i][1];
+
+      const xj=ring[j][0], yj=ring[j][1];
+
+      const intersect = ((yi>ptLat)!==(yj>ptLat)) &&
+
+        (ptLon < (xj-xi)*(ptLat-yi)/(yj-yi+0.0) + xi);
+
+      if (intersect) inside = !inside;
+
+    }
+
+
+    return inside;
+
+  }
+
+  function inAnyBoundary(lon, lat){
+
+    for (const ring of boundaryPolys){
+
+      if (inRing(lon, lat, ring)) return true;
+
+    }
+
+    return false;
+
+  }
+
+  function metersToLatDeg(m){ return m / 111320; }
+
+  function metersToLonDeg(m, lat){ return m / (111320 * Math.cos(toRad(lat))); }
+
+  function parseBoundary(feature){
+
+    // We take only outer rings of Polygon/MultiPolygon for speed.
+
+    const g = feature.geometry;
+
+    if (!g) return;
+
+    if (g.type === "Polygon"){
+
+      const outer = g.coordinates && g.coordinates[0];
+
+      if (outer && outer.length > 3) boundaryPolys.push(outer);
+
+    } else if (g.type === "MultiPolygon"){
+
+      for (const poly of (g.coordinates || [])){
+
+        const outer = poly && poly[0];
+
+        if (outer && outer.length > 3) boundaryPolys.push(outer);
+
+      }
+
+    }
+
+  }
+
+  function parseShop(feature){
+
+    const g = feature.geometry;
+
+    if (!g || g.type !== "Point") return;
+
+    const props = feature.properties || {};
+
+    const shop = props.shop;
+
+    if (shop !== "florist" && shop !== "garden_centre") return;
+
+    const [lon, lat] = g.coordinates;
+
+    shops.push({lat, lon, shop});
+
+  }
+
+  fileEl.addEventListener('change', async () => {
+
+    const f = fileEl.files && fileEl.files[0];
+
+    if (!f) return;
+
+
+    log("Lade Datei…");
+
+    const text = await f.text();
+
+    const geo = JSON.parse(text);
+
+    boundaryPolys = [];
+
+    shops = [];
+
+    outGeo = null;
+
+    const features = geo.features || [];
+
+    for (const ft of features){
+
+      // Boundary detection: geometry polygons from "out geom" relation
+
+      if (ft.geometry && (ft.geometry.type === "Polygon" || ft.geometry.type === "MultiPolygon")){
+
+        parseBoundary(ft);
+
+      }
+
+      // Shops: points from out center
+
+      if (ft.geometry && ft.geometry.type === "Point"){
+
+        parseShop(ft);
+
+      }
+
+    }
+
+    if (!boundaryPolys.length){
+
+      log("Keine München-Grenze (Polygon/MultiPolygon) gefunden. Bitte Overpass-Export mit
+
+'out geom' für die Relation ausführen.");
+
+      runBtn.disabled = true;
+
+      return;
+
+    }
+
+    if (!shops.length){
+
+      log("Keine Shops gefunden. Prüfe, ob shop=florist / shop=garden_centre im Export enthalten
+
+sind.");
+
+      runBtn.disabled = true;
+
+      return;
+
+    }
+
+    runBtn.disabled = false;
+
+    log(`OK: Grenze(n): ${boundaryPolys.length} Polygon(e), Shops: ${shops.length} Punkte.
+
+\nJetzt „Raster berechnen“.`);
+
+  });
+
+  function minDist(lat, lon){
+
+    let best = Infinity;
+
+    let nearest = "";
+
+
+    for (const s of shops){
+
+      const d = haversine(lat, lon, s.lat, s.lon);
+
+      if (d < best){
+
+        best = d;
+
+        nearest = s.shop;
+
+      }
+
+    }
+
+    return {best, nearest};
+
+  }
+
+  runBtn.addEventListener('click', () => {
+
+    const gridM = Math.max(50, Number(gridEl.value) || 100);
+
+    // Bounding box from boundary polygons
+
+    let minLon=Infinity, minLat=Infinity, maxLon=-Infinity, maxLat=-Infinity;
+
+    for (const ring of boundaryPolys){
+
+      for (const [lon,lat] of ring){
+
+        if (lon<minLon) minLon=lon;
+
+        if (lat<minLat) minLat=lat;
+
+        if (lon>maxLon) maxLon=lon;
+
+        if (lat>maxLat) maxLat=lat;
+
+      }
+
+    }
+
+    const midLat = (minLat+maxLat)/2;
+
+    const dLat = metersToLatDeg(gridM);
+
+    const dLon = metersToLonDeg(gridM, midLat);
+
+    log(`Berechne Raster…\nBBox: ${minLat.toFixed(5)},${minLon.toFixed(5)} → $
+
+{maxLat.toFixed(5)},${maxLon.toFixed(5)}\nSchritt: ~${gridM}m`);
+
+    // Generate point grid at cell centers
+
+    const out = [];
+
+    let count = 0;
+
+    // Hinweis: Ganz München bei 100m sind grob ~30k Punkte – kann auf iPad 1–3 Minuten
+
+dauern.
+
+    for (let lat=minLat; lat<=maxLat; lat+=dLat){
+
+      for (let lon=minLon; lon<=maxLon; lon+=dLon){
+
+        const cLat = lat + dLat/2;
+
+        const cLon = lon + dLon/2;
+
+
+✅
+
+        if (!inAnyBoundary(cLon, cLat)) continue;
+
+        const {best, nearest} = minDist(cLat, cLon);
+
+        const dist = Math.round(best);
+
+        out.push({
+
+          type: "Feature",
+
+          properties: {
+
+            distance_m: dist,
+
+            inv_intensity: 1.0 / (best + 1.0),
+
+            nearest: nearest
+
+          },
+
+          geometry: { type: "Point", coordinates: [cLon, cLat] }
+
+        });
+
+        count++;
+
+        // primitive progress update
+
+        if (count % 2000 === 0){
+
+          log(`Berechne Raster… bisher ${count} Punkte innerhalb München…`);
+
+        }
+
+      }
+
+    }
+
+    outGeo = { type:"FeatureCollection", features: out };
+
+    dlBtn.disabled = false;
+
+    log(`Fertig
+
+\nRasterpunkte innerhalb München: ${out.length}\nJetzt „GeoJSON
+
+herunterladen“.`);
+
+  });
+
+  dlBtn.addEventListener('click', () => {
+
+    if (!outGeo) return;
+
+    const blob = new Blob([JSON.stringify(outGeo)], {type:"application/geo+json"});
+
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement('a');
+
+    a.href = url;
+
+    a.download = "munich_grid_distance.geojson";
+
+    document.body.appendChild(a);
+
+    a.click();
+
+    a.remove();
+
+
+    URL.revokeObjectURL(url);
+
+  });
+
+</script>
+
+</body>
+
+</html>
+
